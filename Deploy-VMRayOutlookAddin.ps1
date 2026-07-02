@@ -275,6 +275,31 @@ function Connect-AzSmart {
   Write-Host "  Connected as $($azContext.Account.Id)." -ForegroundColor Green
 }
 
+# Web App names must be globally unique (they become <name>.azurewebsites.net).
+# Ask Azure's CheckNameAvailability API before committing to a multi-minute
+# deploy, so a taken name is caught in seconds instead of failing late with a
+# "Website with given name ... already exists (Conflict)" error.
+# Returns a PSCustomObject { Available; Message }, or $null if the check itself
+# couldn't run (transient/permissions) - in which case the caller proceeds and
+# lets the real deployment surface any conflict.
+function Test-WebAppNameAvailable {
+  param([string]$Name)
+  try {
+    $subId   = (Get-AzContext).Subscription.Id
+    $payload = @{ name = $Name; type = "Microsoft.Web/sites" } | ConvertTo-Json -Compress
+    $resp = Invoke-AzRestMethod -Method POST `
+      -Path "/subscriptions/$subId/providers/Microsoft.Web/checknameavailability?api-version=2023-01-01" `
+      -Payload $payload -ErrorAction Stop
+    $result = $resp.Content | ConvertFrom-Json
+    return [pscustomobject]@{
+      Available = [bool]$result.nameAvailable
+      Message   = $result.message
+    }
+  } catch {
+    return $null
+  }
+}
+
 function Invoke-WithGraphRetry {
   param(
     [Parameter(Mandatory=$true)][scriptblock]$Block,
@@ -438,7 +463,10 @@ function Test-AdminConsentGranted {
     }
     return $true
   } catch {
-    return $false   # If anything errors, assume not granted (safer)
+    # Surface the real error (rare) instead of silently swallowing it, so a
+    # genuine permission/API failure doesn't masquerade as "consent not granted".
+    Write-Host "    (consent check couldn't complete: $($_.Exception.Message))" -ForegroundColor DarkGray
+    return $false
   }
 }
 
@@ -454,6 +482,13 @@ function Wait-ForConsentToPropagate {
   )
 
   Write-Host "  Verifying consent..." -ForegroundColor Gray
+
+  # Check immediately first - if consent has already propagated, detect it
+  # instantly instead of always burning the initial 15s.
+  if (Test-AdminConsentGranted -AppIdToCheck $AppIdToCheck) {
+    Write-Host "  Consent confirmed for all 4 permissions." -ForegroundColor Green
+    return $true
+  }
 
   for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
     Start-Sleep -Seconds $RetryDelay
@@ -570,23 +605,30 @@ else {
 
   if ($appChoice -eq 1) {
     # ----- NEW App Reg path -----
-    if (-not $DisplayName) {
-      $DisplayName = Read-Text -Prompt "Display name for the new App Registration" `
-                                -Default "VMRay-Outlook-Addin-App"
-    }
+    # Loop until we have a name the user is happy to create. If duplicates exist
+    # and the user declines to reuse the name, re-prompt for a different one
+    # instead of exiting the whole script.
+    while ($true) {
+      if (-not $DisplayName) {
+        $DisplayName = Read-Text -Prompt "Display name for the new App Registration" `
+                                  -Default "VMRay-Outlook-Addin-App"
+      }
 
-    # Warn on duplicates
-    $existing = Invoke-WithGraphRetry -Description "checking for duplicates" -Block {
-      $escName = $DisplayName.Replace("'", "''")
-      @(Get-MgApplication -Filter "displayName eq '$escName'")
-    }
-    if ($existing.Count -gt 0) {
+      # Warn on duplicates
+      $existing = Invoke-WithGraphRetry -Description "checking for duplicates" -Block {
+        $escName = $DisplayName.Replace("'", "''")
+        @(Get-MgApplication -Filter "displayName eq '$escName'")
+      }
+      if ($existing.Count -eq 0) { break }
+
       Write-Host ""
       Write-Host "  WARNING: $($existing.Count) App Registration(s) named '$DisplayName' already exist:" -ForegroundColor Yellow
       $existing | ForEach-Object { Write-Host "    - AppId: $($_.AppId)" -ForegroundColor Yellow }
-      if (-not (Confirm-Action "Create another with the same name?" -Default $false)) {
-        throw "Aborted. Re-run with a different -DisplayName or choose 'Use existing'."
-      }
+      if (Confirm-Action "Create another with the same name?" -Default $false) { break }
+
+      # User declined - clear the name so the loop re-prompts for a different one.
+      Write-Host "  Please enter a different name for the new App Registration." -ForegroundColor Yellow
+      $DisplayName = $null
     }
 
     Write-Step "1/3" "Creating App Registration '$DisplayName'..."
@@ -634,18 +676,27 @@ else {
   }
   else {
     # ----- EXISTING App Reg path -----
-    if (-not $AppId) {
-      $nameOrId = Read-Text -Prompt "Enter App Registration name OR Application (Client) ID"
-    } else {
-      $nameOrId = $AppId
+    # Loop until we locate a matching App Registration. A mistyped name/AppId
+    # re-prompts instead of exiting the whole script.
+    $app = $null
+    while ($true) {
+      if (-not $AppId) {
+        $nameOrId = Read-Text -Prompt "Enter App Registration name OR Application (Client) ID"
+      } else {
+        $nameOrId = $AppId
+      }
+
+      $candidates = Find-AppRegistration -NameOrAppId $nameOrId
+      if ($candidates.Count -gt 0) {
+        $app = Select-AppRegistration -Candidates $candidates
+        break
+      }
+
+      Write-Host "    No App Registration found matching '$nameOrId'. Check the name/AppId and try again." -ForegroundColor Red
+      # Clear the parameter value so the loop prompts interactively next time.
+      $AppId = $null
     }
 
-    $candidates = Find-AppRegistration -NameOrAppId $nameOrId
-    if ($candidates.Count -eq 0) {
-      throw "No App Registration found matching '$nameOrId'. Run again with the correct name/AppId, or choose 'Create new'."
-    }
-
-    $app = Select-AppRegistration -Candidates $candidates
     Write-Host ""
     Write-Host "  Selected: $($app.DisplayName)  (AppId: $($app.AppId))" -ForegroundColor Green
 
@@ -742,13 +793,20 @@ else {
         Write-Host "  Verify in Portal: Entra ID -> App Reg -> API permissions -> Status column." -ForegroundColor Gray
 
         $recoveryChoice = Read-Choice -Prompt "What would you like to do?" -Options @(
-          "Re-open the consent URL and try again (recommended)",
+          "Wait another 90s and re-check (consent often just needs more time to propagate)",
+          "Re-open the consent URL and try again (if the Accept click may not have registered)",
+          "I've confirmed consent IS granted in the Portal - continue as granted",
           "Continue with deployment anyway (add-in won't work until consent is fixed later)",
           "Abort"
         ) -Default 1
 
         switch ($recoveryChoice) {
           1 {
+            # Pure propagation lag: re-poll without forcing a re-click of Accept.
+            Write-Host ""
+            $consentVerified = Wait-ForConsentToPropagate -AppIdToCheck $appClientId
+          }
+          2 {
             Write-Host ""
             Write-Host "  Re-opening consent URL:" -ForegroundColor Cyan
             Write-Host "    $consentUrl" -ForegroundColor Gray
@@ -757,13 +815,20 @@ else {
             Wait-ForEnter "After clicking Accept again, press ENTER"
             $consentVerified = Wait-ForConsentToPropagate -AppIdToCheck $appClientId
           }
-          2 {
+          3 {
+            # Manual override: the user can see the green tick in the Portal even
+            # though Graph's read-side hasn't caught up. Trust it and proceed as
+            # granted (NOT deferred), so the final summary won't flag consent.
+            Write-Host "  Trusting Portal confirmation - continuing as granted." -ForegroundColor Green
+            $consentVerified = $true
+          }
+          4 {
             Write-Host "  Continuing without verified consent. Add-in won't work until consent is granted manually." -ForegroundColor Yellow
             $continueWithoutConsent  = $true
             $consentDeferredToAdmin  = $true
             $deferredConsentUrl      = $consentUrl
           }
-          3 {
+          5 {
             throw "Aborted by user. Re-run after consent propagates."
           }
         }
@@ -785,10 +850,32 @@ if ($SkipDeploy.IsPresent) {
 else {
   Write-Phase "2" "Deploy Azure Web App"
 
-  if (-not $WebAppName) {
-    $WebAppName = Read-Text -Prompt "Web App name (1-20 chars, alphanumeric+hyphens)" `
-                            -ValidationPattern '^[a-zA-Z0-9-]{1,20}$' `
-                            -ValidationMessage "Must be 1-20 chars, letters/numbers/hyphens only."
+  # Loop until we have a globally-available Web App name. The name becomes a
+  # public hostname, so a taken name is rejected up front (in seconds) rather
+  # than after several minutes of deployment.
+  while ($true) {
+    if (-not $WebAppName) {
+      $WebAppName = Read-Text -Prompt "Web App name (1-20 chars, alphanumeric+hyphens)" `
+                              -ValidationPattern '^[a-zA-Z0-9-]{1,20}$' `
+                              -ValidationMessage "Must be 1-20 chars, letters/numbers/hyphens only."
+    }
+
+    $availability = Test-WebAppNameAvailable -Name $WebAppName
+    if (-not $availability) {
+      Write-Host "  Could not verify name availability - continuing (the deployment will catch any conflict)." -ForegroundColor Yellow
+      break
+    }
+    if ($availability.Available) {
+      Write-Host "  Web App name '$WebAppName' is available." -ForegroundColor Green
+      break
+    }
+
+    Write-Host ""
+    Write-Host "  Web App name '$WebAppName' is not available:" -ForegroundColor Red
+    if ($availability.Message) { Write-Host "    $($availability.Message)" -ForegroundColor Red }
+    Write-Host "  Web App names must be unique across all of Azure. Please choose another." -ForegroundColor Yellow
+    # Clear so the loop re-prompts (also drops a name supplied via -WebAppName).
+    $WebAppName = $null
   }
 
   if (-not $ResourceGroup) {
@@ -810,7 +897,14 @@ else {
   }
 
   if (-not $PSBoundParameters.ContainsKey('Sku')) {
-    $Sku = Read-Text -Prompt "App Service SKU (B1/B2/B3/S1/S2/S3/P1v3/P2v3)" -Default $Sku
+    # Numbered picker built from the same fixed SKU list as the -Sku parameter's
+    # ValidateSet, so an invalid value can't be typed. Default to whatever $Sku
+    # currently holds (S1 unless overridden).
+    $skuOptions = @("B1","B2","B3","S1","S2","S3","P1v3","P2v3")
+    $skuDefault = [array]::IndexOf($skuOptions, $Sku) + 1
+    if ($skuDefault -lt 1) { $skuDefault = 4 }   # fall back to S1
+    $skuPick = Read-Choice -Prompt "App Service SKU:" -Options $skuOptions -Default $skuDefault
+    $Sku = $skuOptions[$skuPick - 1]
   }
 
   if (-not $Recipient) {
@@ -890,6 +984,20 @@ else {
     }
   }
 
+  # Remove any stale 'waitForWebApp' deployment script from a previous run.
+  # A Microsoft.Resources/deploymentScripts resource keeps a fixed name and
+  # lingers in the RG (with async-deleted backing ACI + storage). Re-deploying
+  # into the same RG collides with those leftovers and fails the deployment.
+  # Deleting the resource first forces a full teardown so the redeploy is clean.
+  $staleScript = Get-AzResource -ResourceGroupName $ResourceGroup `
+    -ResourceType "Microsoft.Resources/deploymentScripts" `
+    -Name "waitForWebApp" -ErrorAction SilentlyContinue
+  if ($staleScript) {
+    Write-Host "  Removing stale 'waitForWebApp' deployment script from a previous run..." -ForegroundColor Yellow
+    Remove-AzResource -ResourceId $staleScript.ResourceId -Force -ErrorAction SilentlyContinue | Out-Null
+    Write-Host "  Removed." -ForegroundColor Green
+  }
+
   # Deploy
   Write-Step "3/3" "Deploying (this may take up to 10 minutes)..."
   $deploymentName = "vmray-outlook-$(Get-Date -Format 'yyyyMMddHHmmss')"
@@ -933,9 +1041,37 @@ if ($SkipFinalize.IsPresent) {
 else {
   Write-Phase "3" "Configure App Registration for domain '$domain'"
 
-  # Reload app fresh (state may have changed since Phase 1)
-  $app = Invoke-WithGraphRetry -Description "reloading App Reg" -Block {
-    Get-MgApplication -Filter "appId eq '$appClientId'" -ErrorAction SilentlyContinue | Select-Object -First 1
+  # Reload app fresh (state may have changed since Phase 1).
+  # Do NOT use -ErrorAction SilentlyContinue here: Phase 2 can take several
+  # minutes, during which the Graph token may expire. SilentlyContinue would
+  # swallow that auth error and return $null, which later surfaces as the cryptic
+  # "Cannot bind argument to parameter 'ApplicationId' ... empty string" at the
+  # Update-MgApplication call below. Instead let Invoke-WithGraphRetry catch the
+  # auth error and reconnect, retry a few times to absorb Graph replication lag,
+  # and fail with an actionable message if the App Reg still can't be read.
+  $app = $null
+  for ($reloadAttempt = 1; $reloadAttempt -le 5; $reloadAttempt++) {
+    try {
+      $app = Invoke-WithGraphRetry -Description "reloading App Reg" -Block {
+        Get-MgApplication -Filter "appId eq '$appClientId'" -ErrorAction Stop | Select-Object -First 1
+      }
+    } catch {
+      Write-Host "  Reload attempt $reloadAttempt failed: $($_.Exception.Message)" -ForegroundColor Gray
+    }
+    if ($app -and $app.Id) { break }
+    if ($reloadAttempt -lt 5) {
+      Write-Host "  App Registration not readable yet (token or replication lag). Retrying in 5s..." -ForegroundColor Gray
+      Start-Sleep -Seconds 5
+    }
+  }
+  if (-not $app -or -not $app.Id) {
+    throw @"
+Could not reload App Registration '$appClientId' from Microsoft Graph after 5 attempts.
+Your Graph session likely expired during Phase 2 (which can take several minutes).
+Reconnect and re-run Phase 3 only:
+  Connect-MgGraph -Scopes Application.ReadWrite.All
+  ./Deploy-VMRayOutlookAddin.ps1 -SkipSetup -SkipDeploy -AppId '$appClientId' -ClientSecret <secret> -WebAppName '$WebAppName'
+"@
   }
 
   # Compute identifier URI
