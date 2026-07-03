@@ -715,7 +715,12 @@ else {
       if ($secretChoice -eq 1) {
         Write-Host ""
         Write-Host "  Paste the client secret value (input hidden):" -ForegroundColor Yellow
-        $appClientSecret = Read-Host -AsSecureString "  Client Secret"
+        do {
+          $appClientSecret = Read-Host -AsSecureString "  Client Secret"
+          if ($appClientSecret.Length -eq 0) {
+            Write-Host "  Client secret cannot be empty. Please paste a value." -ForegroundColor Red
+          }
+        } while ($appClientSecret.Length -eq 0)
       } else {
         Write-Host "  Creating a fresh client secret (existing secrets stay valid)..." -ForegroundColor Yellow
         $secretParams = @{
