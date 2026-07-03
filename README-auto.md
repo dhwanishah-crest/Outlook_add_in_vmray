@@ -65,7 +65,7 @@ Phases 2 and 3 can run even if the script operator isn't authorized to grant con
 
 ### Step 2 — Upload the deployment script
 
-Click **Manage files → Upload** in the Cloud Shell toolbar and upload this file from this repo:
+Click **Manage files → Upload** in the Cloud Shell toolbar and upload this file from the repo:
 
 - `Scripts/Deploy-VMRayOutlookAddin.ps1`
 
@@ -97,7 +97,7 @@ You'll be asked:
 | Web App name (1-20 chars, alphanumeric+hyphens) | A globally unique name, e.g., `vmray-outlook-acme` |
 | Resource group name | Existing RG, or a new name (created if missing) |
 | Azure region | **Only asked if the resource group is new.** If you reused an existing RG, the script auto-uses that RG's location. For new RGs, press Enter for the default (Central US) or type a closer region (e.g., `Central India`, `North Europe`). |
-| App Service SKU | Press Enter for default (S1) |
+| App Service SKU | Choose from the numbered list (B1/B2/B3/S1/S2/S3/P1v3/P2v3); press Enter for the default (S1) |
 | IR mailbox email address | Your VMRay IR mailbox, e.g., `xxx@us.ir-mailbox.vmray.com` |
 | Move reported emails to a folder? | Press Enter for default (No) |
 | Proceed with deployment? | Press Enter to confirm |
@@ -233,13 +233,15 @@ Consent step:
 
 **What's happening:** You chose option [1] above, but after clicking Accept, Microsoft's grant database takes 10-90 seconds to propagate to the Graph API that the script uses to verify consent. The script retries for up to 90 seconds before showing this warning.
 
-**What to do:** The script will offer three options:
+**What to do:** The script will offer five options:
 
-1. **Re-open the consent URL** — most common fix. Sometimes the first Accept click doesn't actually register (browser caching, multiple accounts signed in, etc.). Re-clicking usually works. **Tip:** open the URL in an InPrivate/Incognito window for the cleanest session.
-2. **Continue anyway** — script proceeds; consent must be granted manually later before users can use the add-in (same as choosing Skip up-front)
-3. **Abort** — bail out completely
+1. **Wait another 90s and re-check** — pure propagation lag; re-polls Microsoft Graph without needing another Accept click. Try this first, since the grant often just needs more time to propagate.
+2. **Re-open the consent URL and try again** — for when the Accept click may not have registered (browser caching, multiple accounts signed in, etc.). **Tip:** open the URL in an InPrivate/Incognito window for the cleanest session.
+3. **I've confirmed consent IS granted in the Portal — continue as granted** — use this if you can already see green checkmarks in Entra ID → App Registration → API permissions but Graph's read-side hasn't caught up. The script trusts your confirmation and proceeds as granted (not deferred), so the final summary won't flag consent.
+4. **Continue with deployment anyway** — script proceeds; consent must be granted manually later before users can use the add-in (same as choosing Skip up-front).
+5. **Abort** — bail out completely.
 
-**Recommended:** choose option 1. If it still fails after several re-clicks, verify in Portal → Entra ID → App Registration → API permissions. Look for green checkmarks in the **Status** column.
+**Recommended:** start with option 1 (wait) or 2 (re-click). If you can already see the grant in the Portal (green checkmarks in the **Status** column), use option 3.
 
 ### "Temporary server issue" when users click Report Phishing
 
